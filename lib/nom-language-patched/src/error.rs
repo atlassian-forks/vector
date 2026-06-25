@@ -127,7 +127,12 @@ pub fn convert_error<I: core::ops::Deref<Target = str>>(input: I, e: VerboseErro
   let mut result = String::new();
 
   for (i, (substring, kind)) in e.errors.iter().enumerate() {
-    let offset = input.offset(substring);
+    // `input.offset(substring)` is pointer arithmetic that assumes `substring`
+    // points inside `input`. When that does not hold (e.g. the substring comes
+    // from a different input buffer), the raw offset can be meaningless and
+    // enormous. Clamp it to the input length so all downstream indexing stays in
+    // bounds.
+    let offset = input.offset(substring).min(input.len());
 
     if input.is_empty() {
       match kind {
@@ -159,8 +164,14 @@ pub fn convert_error<I: core::ops::Deref<Target = str>>(input: I, e: VerboseErro
         .unwrap_or(&input[line_begin..])
         .trim_end();
 
-      // The (1-indexed) column number is the offset of our substring into that line
-      let column_number = line.offset(substring) + 1;
+      // The (1-indexed) column of the substring within the displayed line,
+      // clamped to the line so it stays in range.
+      let column_number = (offset.saturating_sub(line_begin) + 1).min(line.len() + 1);
+
+      // Build the caret indicator explicitly (`column_number - 1` leading spaces
+      // followed by `^`) rather than using a `{:>width$}` format specifier, which
+      // panics for very large widths ("Formatting argument out of range").
+      let caret = format!("{}^", " ".repeat(column_number.saturating_sub(1)));
 
       match kind {
         VerboseErrorKind::Char(c) => {
@@ -169,13 +180,12 @@ pub fn convert_error<I: core::ops::Deref<Target = str>>(input: I, e: VerboseErro
               &mut result,
               "{i}: at line {line_number}:\n\
                {line}\n\
-               {caret:>column$}\n\
+               {caret}\n\
                expected '{expected}', found {actual}\n\n",
               i = i,
               line_number = line_number,
               line = line,
-              caret = '^',
-              column = column_number,
+              caret = caret,
               expected = c,
               actual = actual,
             )
@@ -184,13 +194,12 @@ pub fn convert_error<I: core::ops::Deref<Target = str>>(input: I, e: VerboseErro
               &mut result,
               "{i}: at line {line_number}:\n\
                {line}\n\
-               {caret:>column$}\n\
+               {caret}\n\
                expected '{expected}', got end of input\n\n",
               i = i,
               line_number = line_number,
               line = line,
-              caret = '^',
-              column = column_number,
+              caret = caret,
               expected = c,
             )
           }
@@ -199,25 +208,23 @@ pub fn convert_error<I: core::ops::Deref<Target = str>>(input: I, e: VerboseErro
           &mut result,
           "{i}: at line {line_number}, in {context}:\n\
              {line}\n\
-             {caret:>column$}\n\n",
+             {caret}\n\n",
           i = i,
           line_number = line_number,
           context = s,
           line = line,
-          caret = '^',
-          column = column_number,
+          caret = caret,
         ),
         VerboseErrorKind::Nom(e) => write!(
           &mut result,
           "{i}: at line {line_number}, in {nom_err:?}:\n\
              {line}\n\
-             {caret:>column$}\n\n",
+             {caret}\n\n",
           i = i,
           line_number = line_number,
           nom_err = e,
           line = line,
-          caret = '^',
-          column = column_number,
+          caret = caret,
         ),
       }
     }
@@ -259,4 +266,117 @@ fn issue_1027_convert_error_panic_nonempty() {
     msg,
     "0: at line 1:\na\n ^\nexpected \'b\', got end of input\n\n"
   );
+}
+
+// A substring from a different allocation than `input` makes
+// `input.offset(substring)` produce a meaningless, enormous offset.
+// `convert_error` must clamp it instead of panicking.
+#[test]
+fn convert_error_handles_substring_from_other_allocation() {
+  use nom::error::ErrorKind;
+
+  let input = "first line\nsecond line\n";
+
+  let other = String::from("an unrelated buffer in a different allocation");
+  let substring: &str = &other[..];
+
+  let err = VerboseError {
+    errors: vec![(substring, VerboseErrorKind::Nom(ErrorKind::Tag))],
+  };
+
+  let msg = convert_error(input, err);
+
+  assert!(msg.contains("in Tag"));
+  assert!(!msg.is_empty());
+}
+
+// The caret column must stay within the displayed line for an ordinary,
+// in-bounds error.
+#[test]
+fn convert_error_clamps_caret_column_to_line() {
+  use nom::error::ErrorKind;
+
+  let input = "abc\ndef";
+  // Empty substring pointing one past the end of the input.
+  let substring = &input[input.len()..];
+
+  let err = VerboseError {
+    errors: vec![(substring, VerboseErrorKind::Nom(ErrorKind::Eof))],
+  };
+
+  let msg = convert_error(input, err);
+
+  // The caret line must not be padded beyond the displayed line length + 1.
+  let caret_line = msg
+    .lines()
+    .find(|l| l.trim_start().starts_with('^'))
+    .expect("expected a caret line");
+  assert!(
+    caret_line.len() <= "def".len() + 1,
+    "caret column was not clamped: {caret_line:?}"
+  );
+}
+
+// A long single line yields a large column number; building the caret manually
+// (rather than via a `{:>width$}` format specifier) keeps this from panicking.
+#[test]
+fn convert_error_handles_large_column_without_panicking() {
+  use nom::error::ErrorKind;
+
+  // A single ~200k-char line followed by the text where parsing "fails".
+  let input = "x".repeat(200_000) + "parsing fails here";
+  let input_str = input.as_str();
+
+  // An in-bounds substring far from the start of the line (column ~199_001).
+  let error_location = &input_str[199_000..];
+
+  let err = VerboseError {
+    errors: vec![(error_location, VerboseErrorKind::Nom(ErrorKind::Tag))],
+  };
+
+  let msg = convert_error(input_str, err);
+
+  assert!(msg.contains("in Tag"));
+  // The caret is positioned at the (1-indexed) column: 199_000 spaces then '^'.
+  let caret_line = msg
+    .lines()
+    .find(|l| l.trim_start().starts_with('^'))
+    .expect("expected a caret line");
+  assert_eq!(caret_line.len(), 199_001);
+}
+
+// `convert_error` must never index `input` out of bounds, for any substring
+// offset or `VerboseErrorKind`, including on multi-byte UTF-8 input (so we never
+// slice on a non-char-boundary).
+#[test]
+fn convert_error_never_panics_on_any_offset() {
+  use nom::error::ErrorKind;
+
+  let inputs = [
+    "2026/06/25 04:27:04 http: TLS handshake error from 10.62.0.229:49835: EOF",
+    "héllo wörld\nsécond lïne with ünïcode é",
+    "",
+    "\n\n\n",
+    "single line no newline",
+  ];
+
+  for input in inputs {
+    for off in 0..=input.len() {
+      if !input.is_char_boundary(off) {
+        continue;
+      }
+      let substring = &input[off..];
+      for kind in [
+        VerboseErrorKind::Nom(ErrorKind::Tag),
+        VerboseErrorKind::Context("context"),
+        VerboseErrorKind::Char('z'),
+      ] {
+        let err = VerboseError {
+          errors: vec![(substring, kind)],
+        };
+
+        let _ = convert_error(input, err);
+      }
+    }
+  }
 }

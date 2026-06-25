@@ -112,6 +112,7 @@ members = [
   "lib/k8s-e2e-tests",
   "lib/k8s-test-framework",
   "lib/loki-logproto",
+  "lib/nom-language-patched",
   "lib/prometheus-parser",
   "lib/opentelemetry-proto",
   "lib/tracing-limit",
@@ -494,6 +495,8 @@ nix = { git = "https://github.com/vectordotdev/nix.git", branch = "memfd/gnu/mus
 # The `heim` crates depend on `ntapi` 0.3.7 on Windows, but that version has an
 # unaligned access bug fixed in the following revision.
 ntapi = { git = "https://github.com/MSxDOS/ntapi.git", rev = "24fc1e47677fc9f6e38e5f154e6011dc9b270da6" }
+# Locally vendored & patched copy of `nom-language` 0.1.0 to fix a bug. See lib/nom-language-patched.
+nom-language = { path = "lib/nom-language-patched" }
 
 [features]
 # Default features for *-unknown-linux-gnu and *-apple-darwin
